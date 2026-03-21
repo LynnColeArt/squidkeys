@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Show Go version
+        run: go version
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run race tests
+        run: go test -race ./...
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Validate release script syntax
+        run: bash -n ./scripts/build-release.sh
+
+      - name: Smoke test release packaging
+        run: |
+          rm -rf dist
+          SQUIDKEYS_RELEASE_TARGETS="$(go env GOOS)/$(go env GOARCH)" ./scripts/build-release.sh
+          ls -lh dist
+          test "$(find dist -maxdepth 1 -type f -name 'squidkeys-go_*.tar.gz' | wc -l)" -ge 1
+          test "$(find dist -maxdepth 1 -type f -name 'squidkeys-go_*_checksums.txt' | wc -l)" -ge 1

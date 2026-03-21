@@ -1,0 +1,44 @@
+{
+  "agent_id": "agent-a",
+  "profile": {
+    "name": "work",
+    "platform": "github",
+    "host": "github.com",
+    "git_username": "workuser",
+    "git_email": "work@example.com",
+    "preferred_transport": "ssh",
+    "https_credential_ref": {
+      "record_type": "authorization",
+      "provider": "github",
+      "account_id": "user-123"
+    },
+    "ssh_identity_ref": {
+      "record_type": "password",
+      "name": "github-work-ssh"
+    },
+    "signing_identity_ref": {
+      "record_type": "certificate",
+      "name": "github-work-signing"
+    },
+    "signing_format": "x509",
+    "repo_matchers": [
+      "github.com/work/*",
+      "github.com/org/*"
+    ],
+    "metadata": {
+      "team": "ops"
+    }
+  },
+  "authorization": {
+    "provider": "github",
+    "account_id": "user-123",
+    "access_token": "oauth-token"
+  },
+  "password": {
+    "name": "github-work-ssh",
+    "password": "ssh-private-key"
+  },
+  "certificate": {
+    "name": "github-work-signing"
+  }
+}

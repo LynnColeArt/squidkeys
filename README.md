@@ -512,6 +512,15 @@ Run the Python compatibility harness for the original authorization/password for
 ./scripts/run-python-compat.sh
 ```
 
+GitHub Actions runs the same core verification on pushes to `main`, pull requests, and manual dispatches:
+
+- `go test ./...`
+- `go test -race ./...`
+- `go vet ./...`
+- a release-packaging smoke test via `./scripts/build-release.sh`
+
+The workflow lives at `.github/workflows/ci.yml`.
+
 ## Project Layout
 
 - `cmd/squidkeys-api`: HTTP server entrypoint
