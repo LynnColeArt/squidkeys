@@ -279,6 +279,8 @@ export KEY_STORE_MASTER_KEY='REPLACE_WITH_BASE64URL_32_BYTE_KEY'
 - `KEY_STORE_DB_PATH`
 - `KEY_STORE_ACTIVE_KEK_VERSION`
 - `KEY_STORE_BEARER_TOKEN`
+- `KEY_STORE_ORG_AUTH_POLICY_PATH` (opt-in organization mode)
+- `KEY_STORE_TLS_CERT_FILE` and `KEY_STORE_TLS_KEY_FILE`
 - `KEY_STORE_API_HOST`
 - `KEY_STORE_API_PORT`
 - `KEY_STORE_MCP_TRANSPORT`
@@ -343,6 +345,54 @@ curl \
   -H 'Authorization: Bearer YOUR_TOKEN' \
   http://127.0.0.1:8080/v1/keys/status
 ```
+
+### Organization-level HTTP vault (opt-in)
+
+The default loopback API and local MCP process remain backward compatible. To
+serve several installations from one organization vault, set
+`KEY_STORE_ORG_AUTH_POLICY_PATH` to a version-1 JSON policy. Each installation
+holds its own high-entropy bearer token; the file contains only its lowercase
+SHA-256 digest. A read grant names exactly one record. There are no wildcards,
+no implicit access to other installations' records, and no reader writes or
+lists. Only an admin principal can create/delete records or operate KEKs.
+Policies are loaded at startup; changing grants or revoking a token requires
+restarting the API. Protect the policy file and the admin token separately.
+
+Example policy (replace each digest with the SHA-256 hex of a separately
+generated random token):
+
+```json
+{
+  "version": 1,
+  "principals": [
+    {"id": "company-admin", "token_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS", "admin": true},
+    {"id": "coding-installation", "token_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS", "read": [
+      {"record_type": "password", "agent_id": "coding-installation", "name": "github"},
+      {"record_type": "authorization", "agent_id": "coding-installation", "provider": "ollama", "account_id": "production"}
+    ]}
+  ]
+}
+```
+
+`account_id` must be supplied on authorization reads, including an empty value
+for a default account. The server uses the verified principal as the audit
+actor; client-supplied `actor` is ignored in organization mode. Missing tokens
+return 401 and denied grants return 403. `/health` remains unauthenticated and
+contains no vault data.
+
+For a non-loopback bind, the API refuses to start unless both an organization
+policy and TLS certificate/key are configured. Clients must validate the
+server certificate. Never expose the legacy single-token or unauthenticated
+mode remotely. Organization mode cannot be combined with
+`KEY_STORE_BEARER_TOKEN`.
+
+This is a single-vault, single-active-server boundary, not a clustered or
+high-availability secrets service. Back up the encrypted DuckDB file and KEK
+material together, keep the KEK out of the repository, and arrange secure
+bootstrap/recovery before relying on the vault for company operations. MCP
+remains a trusted local stdio process and does not inherit per-installation
+HTTP grants. This first step does not yet centralize all ThickTicket company
+configuration or provision installation tokens automatically.
 
 ## Running the MCP Server
 
@@ -456,6 +506,7 @@ That keeps the switching logic isolated from secret storage.
 - The DB directory is forced to mode `0700` and the DB file to `0600`.
 - Authorization expiry parsing rejects naive timestamps and requires explicit RFC3339 offsets or `Z`.
 - HTTP bearer auth is optional by design for localhost/local-first usage.
+- Organization HTTP mode requires per-installation bearer identities and exact grants.
 - Git profile manifests are plaintext metadata plus refs. They intentionally do not contain raw secrets.
 
 Certificate limitations:

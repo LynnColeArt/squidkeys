@@ -16,28 +16,47 @@ type apiError struct {
 const maxJSONBodyBytes int64 = 1 << 20
 
 func NewHTTPHandler(store *KeyStore) http.Handler {
+	return newHTTPHandler(store, nil)
+}
+
+// NewOrganizationHTTPHandler enables the opt-in, per-installation HTTP boundary.
+// Policy must have been validated by ParseOrganizationPolicy.
+func NewOrganizationHTTPHandler(store *KeyStore, policy *OrganizationPolicy) http.Handler {
+	if policy == nil {
+		panic("squidkeys: nil organization policy")
+	}
+	return newHTTPHandler(store, policy)
+}
+
+func newHTTPHandler(store *KeyStore, policy *OrganizationPolicy) http.Handler {
 	if store == nil {
 		panic("squidkeys: nil store")
 	}
 
 	api := &httpAPI{store: store}
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", api.health)
-	mux.HandleFunc("PUT /v1/authorizations", api.saveAuthorization)
-	mux.HandleFunc("GET /v1/authorizations/{agent_id}/{provider}", api.getAuthorization)
-	mux.HandleFunc("DELETE /v1/authorizations/{agent_id}/{provider}", api.deleteAuthorization)
-	mux.HandleFunc("PUT /v1/passwords", api.savePassword)
-	mux.HandleFunc("GET /v1/passwords/{agent_id}/{name}", api.getPassword)
-	mux.HandleFunc("DELETE /v1/passwords/{agent_id}/{name}", api.deletePassword)
-	mux.HandleFunc("PUT /v1/certificates", api.saveCertificate)
-	mux.HandleFunc("GET /v1/certificates/{agent_id}/{name}", api.getCertificate)
-	mux.HandleFunc("DELETE /v1/certificates/{agent_id}/{name}", api.deleteCertificate)
-	mux.HandleFunc("PUT /v1/git-profiles", api.saveGitProfile)
-	mux.HandleFunc("GET /v1/git-profiles", api.listGitProfiles)
-	mux.HandleFunc("GET /v1/git-profiles/{agent_id}/{name}", api.getGitProfile)
-	mux.HandleFunc("DELETE /v1/git-profiles/{agent_id}/{name}", api.deleteGitProfile)
-	mux.HandleFunc("GET /v1/keys/status", api.keyStatus)
-	mux.HandleFunc("POST /v1/keys/rewrap", api.rewrap)
+	register := func(pattern string, kind string, handler http.HandlerFunc) {
+		if policy != nil {
+			handler = policy.guard(kind, handler)
+		}
+		mux.HandleFunc(pattern, handler)
+	}
+	register("GET /health", "health", api.health)
+	register("PUT /v1/authorizations", "admin", api.saveAuthorization)
+	register("GET /v1/authorizations/{agent_id}/{provider}", "authorization", api.getAuthorization)
+	register("DELETE /v1/authorizations/{agent_id}/{provider}", "admin", api.deleteAuthorization)
+	register("PUT /v1/passwords", "admin", api.savePassword)
+	register("GET /v1/passwords/{agent_id}/{name}", "password", api.getPassword)
+	register("DELETE /v1/passwords/{agent_id}/{name}", "admin", api.deletePassword)
+	register("PUT /v1/certificates", "admin", api.saveCertificate)
+	register("GET /v1/certificates/{agent_id}/{name}", "certificate", api.getCertificate)
+	register("DELETE /v1/certificates/{agent_id}/{name}", "admin", api.deleteCertificate)
+	register("PUT /v1/git-profiles", "admin", api.saveGitProfile)
+	register("GET /v1/git-profiles", "admin", api.listGitProfiles)
+	register("GET /v1/git-profiles/{agent_id}/{name}", "git_profile", api.getGitProfile)
+	register("DELETE /v1/git-profiles/{agent_id}/{name}", "admin", api.deleteGitProfile)
+	register("GET /v1/keys/status", "admin", api.keyStatus)
+	register("POST /v1/keys/rewrap", "admin", api.rewrap)
 	return mux
 }
 
@@ -59,7 +78,7 @@ func (a *httpAPI) saveAuthorization(w http.ResponseWriter, r *http.Request) {
 		writeDecodeError(w, err)
 		return
 	}
-	payload.Actor = defaultActor(payload.Actor, "api")
+	payload.Actor = requestActor(r, payload.Actor)
 
 	if err := a.store.SaveAuthorization(payload); err != nil {
 		var validationErr *ValidationError
@@ -95,7 +114,7 @@ func (a *httpAPI) getAuthorization(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("agent_id")
 	provider := r.PathValue("provider")
 	accountID := queryStringPtr(r, "account_id")
-	actor := defaultActor(r.URL.Query().Get("actor"), "api")
+	actor := requestActor(r, r.URL.Query().Get("actor"))
 
 	record, err := a.store.GetAuthorization(agentID, provider, accountID, actor)
 	if err != nil {
@@ -122,7 +141,7 @@ func (a *httpAPI) deleteAuthorization(w http.ResponseWriter, r *http.Request) {
 	agentID := r.PathValue("agent_id")
 	provider := r.PathValue("provider")
 	accountID := queryStringPtr(r, "account_id")
-	actor := defaultActor(r.URL.Query().Get("actor"), "api")
+	actor := requestActor(r, r.URL.Query().Get("actor"))
 
 	deleted, err := a.store.DeleteAuthorization(agentID, provider, accountID, actor)
 	if err != nil {
@@ -147,7 +166,7 @@ func (a *httpAPI) savePassword(w http.ResponseWriter, r *http.Request) {
 		writeDecodeError(w, err)
 		return
 	}
-	payload.Actor = defaultActor(payload.Actor, "api")
+	payload.Actor = requestActor(r, payload.Actor)
 
 	if err := a.store.SavePassword(payload); err != nil {
 		var validationErr *ValidationError
@@ -180,7 +199,7 @@ func (a *httpAPI) getPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor := defaultActor(r.URL.Query().Get("actor"), "api")
+	actor := requestActor(r, r.URL.Query().Get("actor"))
 	record, err := a.store.GetPassword(r.PathValue("agent_id"), r.PathValue("name"), actor)
 	if err != nil {
 		var validationErr *ValidationError
@@ -203,7 +222,7 @@ func (a *httpAPI) deletePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor := defaultActor(r.URL.Query().Get("actor"), "api")
+	actor := requestActor(r, r.URL.Query().Get("actor"))
 	deleted, err := a.store.DeletePassword(r.PathValue("agent_id"), r.PathValue("name"), actor)
 	if err != nil {
 		var validationErr *ValidationError
@@ -227,7 +246,7 @@ func (a *httpAPI) saveCertificate(w http.ResponseWriter, r *http.Request) {
 		writeDecodeError(w, err)
 		return
 	}
-	payload.Actor = defaultActor(payload.Actor, "api")
+	payload.Actor = requestActor(r, payload.Actor)
 
 	if err := a.store.SaveCertificate(payload); err != nil {
 		var validationErr *ValidationError
@@ -260,7 +279,7 @@ func (a *httpAPI) getCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor := defaultActor(r.URL.Query().Get("actor"), "api")
+	actor := requestActor(r, r.URL.Query().Get("actor"))
 	record, err := a.store.GetCertificate(r.PathValue("agent_id"), r.PathValue("name"), actor)
 	if err != nil {
 		var validationErr *ValidationError
@@ -283,7 +302,7 @@ func (a *httpAPI) deleteCertificate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor := defaultActor(r.URL.Query().Get("actor"), "api")
+	actor := requestActor(r, r.URL.Query().Get("actor"))
 	deleted, err := a.store.DeleteCertificate(r.PathValue("agent_id"), r.PathValue("name"), actor)
 	if err != nil {
 		var validationErr *ValidationError
@@ -307,7 +326,7 @@ func (a *httpAPI) saveGitProfile(w http.ResponseWriter, r *http.Request) {
 		writeDecodeError(w, err)
 		return
 	}
-	payload.Actor = defaultActor(payload.Actor, "api")
+	payload.Actor = requestActor(r, payload.Actor)
 
 	if err := a.store.SaveGitProfile(payload); err != nil {
 		var validationErr *ValidationError
@@ -337,7 +356,7 @@ func (a *httpAPI) listGitProfiles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	records, err := a.store.ListGitProfiles(queryStringPtr(r, "agent_id"), queryStringPtr(r, "platform"), defaultActor(r.URL.Query().Get("actor"), "api"))
+	records, err := a.store.ListGitProfiles(queryStringPtr(r, "agent_id"), queryStringPtr(r, "platform"), requestActor(r, r.URL.Query().Get("actor")))
 	if err != nil {
 		var validationErr *ValidationError
 		if errors.As(err, &validationErr) {
@@ -355,7 +374,7 @@ func (a *httpAPI) getGitProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor := defaultActor(r.URL.Query().Get("actor"), "api")
+	actor := requestActor(r, r.URL.Query().Get("actor"))
 	record, err := a.store.GetGitProfile(r.PathValue("agent_id"), r.PathValue("name"), actor)
 	if err != nil {
 		var validationErr *ValidationError
@@ -378,7 +397,7 @@ func (a *httpAPI) deleteGitProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actor := defaultActor(r.URL.Query().Get("actor"), "api")
+	actor := requestActor(r, r.URL.Query().Get("actor"))
 	deleted, err := a.store.DeleteGitProfile(r.PathValue("agent_id"), r.PathValue("name"), actor)
 	if err != nil {
 		var validationErr *ValidationError
@@ -415,7 +434,7 @@ func (a *httpAPI) rewrap(w http.ResponseWriter, r *http.Request) {
 		writeDecodeError(w, err)
 		return
 	}
-	payload.Actor = defaultActor(payload.Actor, "api")
+	payload.Actor = requestActor(r, payload.Actor)
 
 	result, err := a.store.RewrapAllRecords(payload.TargetKEKVersion, payload.Actor)
 	if err != nil {
@@ -432,6 +451,9 @@ func (a *httpAPI) rewrap(w http.ResponseWriter, r *http.Request) {
 }
 
 func requireBearer(w http.ResponseWriter, r *http.Request) bool {
+	if _, ok := r.Context().Value(organizationPrincipalContextKey{}).(string); ok {
+		return true
+	}
 	expected := os.Getenv("KEY_STORE_BEARER_TOKEN")
 	if expected == "" {
 		return true
