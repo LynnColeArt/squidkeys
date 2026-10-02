@@ -1,585 +1,159 @@
-# SquidKeys Go
+# SquidKeys
 
-SquidKeys is a local-first encrypted secret store for agent systems and adjacent developer tooling. It stores secrets in DuckDB, protects secret payloads with per-record data encryption keys wrapped by versioned KEKs, exposes a small HTTP API, and also ships an MCP server for local agents.
+SquidKeys is an encrypted credential store for local agents, developer tools, and installations that need to share a narrowly authorized vault. The Go implementation persists records in a local DuckDB file and exposes them through an HTTP API or a local MCP server. Its central design constraint is separation of responsibilities: SquidKeys stores and retrieves credentials; a consuming application decides when and how to use them.
 
-This Go port currently supports:
+The repository is named `squidkeys`. For compatibility, the Go module remains `github.com/LynnColeArt/squidkeys-go`, and release artifacts retain the `squidkeys-go_` prefix. Renaming the repository does **not** migrate import paths, change the on-disk format, or rename binaries.
 
-- Authorization records for OAuth-style tokens and API credentials
-- Password records for opaque secret blobs
-- Certificate records for X.509 bundles plus private key material
-- Git profile manifests that reference other stored records without performing machine-side switching
+## Scope and data model
 
-## What SquidKeys Is
+| Record | Intended contents | Identity |
+| --- | --- | --- |
+| Authorization | Provider credentials, OAuth-style access/refresh tokens, scopes, and expiry | `agent_id`, provider, account |
+| Password | Opaque secret text such as a PAT, passphrase, or private-key blob | `agent_id`, name |
+| Certificate | X.509 chain with private key and optional passphrase | `agent_id`, name |
+| Git profile | Non-secret Git identity metadata and references to records above | `agent_id`, name |
 
-SquidKeys is the storage layer.
+Git profiles are manifests, not a profile switcher. A separate client may resolve their references and modify Git or SSH configuration. SquidKeys itself does not edit `git config`, rewrite remotes, select an active profile, or materialize secrets on disk. Profile references are validated within the same `agent_id`.
 
-It is responsible for:
+The [API specification](API_SPEC.md) defines record schemas, HTTP routes, MCP tools, and error behavior. The archived [Python implementation](https://github.com/LynnColeArt/SquidKeys-python) remains available for compatibility work; it is not this repository's source of truth.
 
-- Encrypting secret material at rest
-- Validating record shapes and cross-record references
-- Returning secrets to local callers over HTTP or MCP
-- Tracking KEK versions and rewrapping encrypted records
+## Architecture and trust boundaries
 
-It is not responsible for:
-
-- Choosing the current Git profile
-- Editing `git config`
-- Rewriting remotes
-- Managing `~/.ssh/config`
-- Materializing secret refs to files on disk
-
-That split is intentional. A separate switcher such as `gat` should own switching behavior, while SquidKeys owns durable local storage.
-
-## Data Flow Charts
-
-### Secret Storage and Retrieval Flow
-
-This is the core write/read path for authorization, password, and certificate payloads.
+The two interfaces serve different trust models. The HTTP server defaults to loopback and can be configured for an opt-in organization policy. The MCP server communicates over local stdio and inherits the trust of the process that launches it; HTTP organization grants do not apply to MCP.
 
 ```mermaid
 flowchart LR
-  Caller[Local caller]
-  API[HTTP API or MCP tool]
-  Validate[Validate input and record shape]
-  DEK[Generate per-record DEK]
-  Encrypt[Encrypt secret payload with DEK]
-  Wrap[Wrap DEK with active KEK]
-  DB[(DuckDB)]
-  Lookup[Lookup record and metadata]
-  Unwrap[Unwrap DEK with stored KEK version]
-  Decrypt[Decrypt payload]
-
-  Caller --> API
-  API --> Validate
-  Validate --> DEK
-  DEK --> Encrypt
-  DEK --> Wrap
-  Encrypt --> DB
-  Wrap --> DB
-
-  Caller -->|read request| API
-  API --> Lookup
-  DB --> Lookup
-  Lookup --> Unwrap
-  DB --> Unwrap
-  Unwrap --> Decrypt
-  Decrypt --> API
-  API --> Caller
+  subgraph Host[Single vault host]
+    API[HTTP API]
+    MCP[Local MCP stdio process]
+    Store[Validation and encrypted record store]
+    DB[(DuckDB file)]
+    API --> Store
+    MCP --> Store
+    Store --> DB
+  end
+  Local[Local client] -->|Loopback HTTP| API
+  Remote[Authorized installation] -->|TLS and exact-record bearer grant| API
+  Agent[Local MCP host] -->|stdio| MCP
+  KEK[Operator-supplied KEK material] --> Store
 ```
 
-### Git Profile Resolution Flow
+The diagram shows interface boundaries, not a clustered deployment: the current design is a single vault with one active server. Running multiple processes against the same DuckDB file is not an availability strategy. Organization mode does not provision installation identities, distribute tokens, or centralize an entire company's configuration.
 
-This shows the split between SquidKeys as storage and the external switcher as the component that changes machine state.
+### Encryption and rotation
+
+Secret payloads use AES-GCM with a randomly generated data-encryption key (DEK) per record. SquidKeys wraps each DEK under a versioned key-encryption key (KEK). Associated data binds encryption to record identity and key version. The encrypted payload, wrapped DEK, nonces, and key-version metadata are stored in DuckDB; KEK material must be supplied separately at startup.
 
 ```mermaid
 flowchart LR
-  Switcher[Switcher app]
-  Profiles[Git profile manifest]
-  Refs[Secret refs]
-  Auth[Authorization record]
-  Pwd[Password record]
-  Cert[Certificate record]
-  Apply[Apply git and ssh config outside SquidKeys]
-
-  Switcher -->|list and fetch| Profiles
-  Profiles --> Refs
-  Refs --> Auth
-  Refs --> Pwd
-  Refs --> Cert
-  Auth --> Switcher
-  Pwd --> Switcher
-  Cert --> Switcher
-  Switcher --> Apply
+  Plain[Secret payload] -->|Encrypt with record DEK| Cipher[Ciphertext in DuckDB]
+  DEK[Random record DEK] -->|Wrap with active KEK| Wrapped[Wrapped DEK and KEK version in DuckDB]
+  KEK[Operator-held KEK set] -->|Unwrap for read or rewrap| Wrapped
+  Wrapped -->|Recover DEK for authorized read| DEK
+  DEK -->|Decrypt| Cipher
 ```
 
-### KEK Rotation and Rewrap Flow
+Rewrapping changes the DEK's KEK envelope and recorded KEK version without asking clients to resubmit plaintext. Keep older KEKs available until all records have been rewrapped and verified; removing a still-required KEK makes those records unreadable. Back up the encrypted database **and** recoverable KEK material through separate, protected channels. A database backup alone is insufficient for restoration.
 
-This is the data path for rotating wrapped DEKs without rewriting plaintext secrets from the caller side.
+Encryption at rest does not protect against a compromised vault process, host, KEK source, or authorized client. Record identifiers, Git profile manifests, and operational metadata are not substitutes for encrypted secret fields. An authorized read returns plaintext to its caller. Avoid placing tokens or secret payloads in shell history, process arguments, logs, issue reports, or repository files.
 
-```mermaid
-flowchart TD
-  Start[Rewrap request]
-  Load[Load records with non-target KEK version]
-  Unwrap[Unwrap stored DEK with old KEK]
-  Rewrap[Wrap same DEK with target KEK]
-  Update[Update wrapped DEK and kek_version]
-  Finish[Sync active KEK version]
+## Build and run
 
-  Start --> Load
-  Load --> Unwrap
-  Unwrap --> Rewrap
-  Rewrap --> Update
-  Update --> Finish
-```
-
-## Supported Data Model
-
-### Authorizations
-
-Use authorization records for provider-bound access tokens, refresh tokens, scopes, and expiration times.
-
-Examples:
-
-- OAuth access tokens
-- GitHub App or GitLab OAuth-style credentials
-- API tokens that naturally belong to a `provider` and optional `account_id`
-
-### Passwords
-
-Use password records for opaque blobs that should be stored as encrypted text.
-
-Examples:
-
-- Personal access tokens
-- SSH private keys stored as text
-- GPG private key blobs
-- Passphrases
-
-### Certificates
-
-Use certificate records for X.509 bundles when you want the certificate chain, private key, and passphrase stored together and you want SquidKeys to derive searchable certificate metadata.
-
-Examples:
-
-- Client certificates
-- Signing certificates
-- Internal PKI credentials for local automation
-
-### Git Profile Manifests
-
-Use Git profile manifests to describe a Git identity and point at the actual stored secrets required to activate it.
-
-Examples:
-
-- A work GitHub profile
-- A personal GitLab profile
-- A self-hosted Forgejo profile with custom host and signing settings
-
-Important:
-
-- Git profile manifests are not secret containers.
-- They hold metadata plus refs to stored secrets in the same `agent_id`.
-- The switcher app resolves those refs and applies host-side configuration.
-
-## Installation
-
-### Requirements
-
-- Go 1.25.x
-- A platform supported by `duckdb-go`
-
-### Install From a Release Archive
-
-If you publish packaged binaries, the release helper in `scripts/build-release.sh` produces archives named like:
-
-- `squidkeys-go_0.2.0_linux_amd64.tar.gz`
-- `squidkeys-go_0.2.0_darwin_arm64.tar.gz`
-- `squidkeys-go_0.2.0_windows_amd64.tar.gz`
-
-Once those archives are attached to a GitHub Release, a manual install looks like this:
-
-```bash
-VERSION="0.2.0"
-GOOS="linux"
-GOARCH="amd64"
-
-curl -L \
-  -o "squidkeys-go_${VERSION}_${GOOS}_${GOARCH}.tar.gz" \
-  "https://github.com/LynnColeArt/squidkeys-go/releases/download/v${VERSION}/squidkeys-go_${VERSION}_${GOOS}_${GOARCH}.tar.gz"
-
-tar -xzf "squidkeys-go_${VERSION}_${GOOS}_${GOARCH}.tar.gz"
-cd "squidkeys-go_${VERSION}_${GOOS}_${GOARCH}"
-install -m 0755 squidkeys-api /usr/local/bin/squidkeys-api
-install -m 0755 squidkeys-mcp /usr/local/bin/squidkeys-mcp
-```
-
-The archive includes:
-
-- `squidkeys-api`
-- `squidkeys-mcp`
-- `README.md`
-- `API_SPEC.md`
-
-### Build From Source
-
-Build the HTTP API binary:
+Requirements: Go 1.25.x and a platform supported by `duckdb-go`. The commands below operate from a checkout.
 
 ```bash
 go build -o bin/squidkeys-api ./cmd/squidkeys-api
-```
-
-Build the MCP binary:
-
-```bash
 go build -o bin/squidkeys-mcp ./cmd/squidkeys-mcp
 ```
 
-### Install From a Checkout
-
-Install both commands into your Go bin directory:
+Configure a persistent database path and a 32-byte, URL-safe-base64 KEK. `KEY_STORE_KEKS_JSON` is the preferred versioned configuration; `KEY_STORE_MASTER_KEY` remains available for legacy single-key deployments. Generate key material with a cryptographically secure random source, keep it outside the repository, and inject it through your deployment's secret mechanism.
 
 ```bash
-go install ./cmd/squidkeys-api
-go install ./cmd/squidkeys-mcp
-```
-
-If you want the binaries on your shell path, make sure `$(go env GOPATH)/bin` or your configured `GOBIN` is on `PATH`.
-
-### Build Release Archives Locally
-
-Package the current platform:
-
-```bash
-./scripts/build-release.sh
-```
-
-Package a small release matrix:
-
-```bash
-SQUIDKEYS_RELEASE_TARGETS="linux/amd64 linux/arm64 darwin/arm64 windows/amd64" \
-  ./scripts/build-release.sh
-```
-
-Write archives to a custom directory:
-
-```bash
-SQUIDKEYS_RELEASE_DIR="$PWD/out" ./scripts/build-release.sh
-```
-
-The script writes tarballs plus a versioned checksum file into `dist/` by default.
-
-## Configuration
-
-SquidKeys needs a local DB path plus one of the supported KEK configurations.
-
-### Required Secret-Key Configuration
-
-Choose one:
-
-- `KEY_STORE_KEKS_JSON`
-- `KEY_STORE_MASTER_KEY`
-
-`KEY_STORE_KEKS_JSON` is preferred. It should be a JSON object of KEK version to URL-safe base64-encoded 32-byte key.
-
-Example:
-
-```bash
+export KEY_STORE_DB_PATH="${PWD}/keystore.duckdb"
 export KEY_STORE_KEKS_JSON='{"v1":"REPLACE_WITH_BASE64URL_32_BYTE_KEY"}'
 export KEY_STORE_ACTIVE_KEK_VERSION='v1'
-```
-
-Legacy single-key mode is still supported:
-
-```bash
-export KEY_STORE_MASTER_KEY='REPLACE_WITH_BASE64URL_32_BYTE_KEY'
-```
-
-### Useful Environment Variables
-
-- `KEY_STORE_DB_PATH`
-- `KEY_STORE_ACTIVE_KEK_VERSION`
-- `KEY_STORE_BEARER_TOKEN`
-- `KEY_STORE_ORG_AUTH_POLICY_PATH` (opt-in organization mode)
-- `KEY_STORE_TLS_CERT_FILE` and `KEY_STORE_TLS_KEY_FILE`
-- `KEY_STORE_API_HOST`
-- `KEY_STORE_API_PORT`
-- `KEY_STORE_MCP_TRANSPORT`
-
-Defaults:
-
-- API host: `127.0.0.1`
-- API port: `8080`
-- MCP transport: `stdio`
-- DB path: `./keystore.duckdb`
-
-## Quick Start
-
-Start the HTTP API:
-
-```bash
-export KEY_STORE_MASTER_KEY='REPLACE_WITH_BASE64URL_32_BYTE_KEY'
-export KEY_STORE_DB_PATH="$PWD/keystore.duckdb"
-go run ./cmd/squidkeys-api
-```
-
-In another shell, save a password record:
-
-```bash
-curl \
-  -X PUT http://127.0.0.1:8080/v1/passwords \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "agent_id": "desktop-agent",
-    "name": "github-work-pat",
-    "password": "ghp_example_token",
-    "metadata": {
-      "purpose": "https git auth"
-    }
-  }'
-```
-
-Fetch it back:
-
-```bash
-curl http://127.0.0.1:8080/v1/passwords/desktop-agent/github-work-pat
-```
-
-## Running the HTTP API
-
-Run directly from source:
-
-```bash
-go run ./cmd/squidkeys-api
-```
-
-Run a built binary:
-
-```bash
 ./bin/squidkeys-api
 ```
 
-If you set `KEY_STORE_BEARER_TOKEN`, send it with requests:
+The default HTTP bind is `127.0.0.1:8080`. The default database path, if unset, is `./keystore.duckdb`. The server restricts its database directory to mode `0700` and the file to `0600`. Those permissions complement, but do not replace, host and backup security.
 
-```bash
-curl \
-  -H 'Authorization: Bearer YOUR_TOKEN' \
-  http://127.0.0.1:8080/v1/keys/status
-```
+| Setting | Purpose |
+| --- | --- |
+| `KEY_STORE_DB_PATH` | DuckDB file path |
+| `KEY_STORE_KEKS_JSON` | Map of KEK versions to encoded 32-byte keys |
+| `KEY_STORE_ACTIVE_KEK_VERSION` | KEK version for new wraps |
+| `KEY_STORE_MASTER_KEY` | Legacy single-key alternative |
+| `KEY_STORE_API_HOST`, `KEY_STORE_API_PORT` | HTTP bind; defaults to `127.0.0.1:8080` |
+| `KEY_STORE_BEARER_TOKEN` | Optional legacy HTTP bearer token for local deployment |
+| `KEY_STORE_ORG_AUTH_POLICY_PATH` | Opt-in organization HTTP policy |
+| `KEY_STORE_TLS_CERT_FILE`, `KEY_STORE_TLS_KEY_FILE` | TLS identity; required for non-loopback binds |
 
-### Organization-level HTTP vault (opt-in)
+`KEY_STORE_MCP_TRANSPORT` defaults to `stdio`. Launch `./bin/squidkeys-mcp` from a trusted local MCP host with access to the database and KEK configuration. Do not assume that configuring HTTP authorization also restricts this local process.
 
-The default loopback API and local MCP process remain backward compatible. To
-serve several installations from one organization vault, set
-`KEY_STORE_ORG_AUTH_POLICY_PATH` to a version-1 JSON policy. Each installation
-holds its own high-entropy bearer token; the file contains only its lowercase
-SHA-256 digest. A read grant names exactly one record. There are no wildcards,
-no implicit access to other installations' records, and no reader writes or
-lists. Only an admin principal can create/delete records or operate KEKs.
-Policies are loaded at startup; changing grants or revoking a token requires
-restarting the API. Protect the policy file and the admin token separately.
+### Organization HTTP mode
 
-Example policy (replace each digest with the SHA-256 hex of a separately
-generated random token):
+Set `KEY_STORE_ORG_AUTH_POLICY_PATH` to a version-1 JSON policy to identify separate installations with distinct, high-entropy bearer tokens. Store only the lowercase SHA-256 digest of each token in the policy file. Hashing is appropriate here only because the input tokens are randomly generated and high entropy; human passwords are not suitable substitutes.
 
 ```json
 {
   "version": 1,
   "principals": [
-    {"id": "company-admin", "token_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS", "admin": true},
-    {"id": "coding-installation", "token_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS", "read": [
-      {"record_type": "password", "agent_id": "coding-installation", "name": "github"},
-      {"record_type": "authorization", "agent_id": "coding-installation", "provider": "ollama", "account_id": "production"}
-    ]}
+    {
+      "id": "company-admin",
+      "token_sha256": "REPLACE_WITH_64_LOWERCASE_HEX_CHARACTERS",
+      "admin": true
+    },
+    {
+      "id": "coding-installation",
+      "token_sha256": "REPLACE_WITH_ANOTHER_64_LOWERCASE_HEX_DIGEST",
+      "read": [
+        {"record_type": "password", "agent_id": "coding-installation", "name": "github"},
+        {"record_type": "authorization", "agent_id": "coding-installation", "provider": "ollama", "account_id": "production"}
+      ]
+    }
   ]
 }
 ```
 
-`account_id` must be supplied on authorization reads, including an empty value
-for a default account. The server uses the verified principal as the audit
-actor; client-supplied `actor` is ignored in organization mode. Missing tokens
-return 401 and denied grants return 403. `/health` remains unauthenticated and
-contains no vault data.
+Each reader grant identifies **one exact record**. Reader principals cannot list, write, delete, or manage KEKs; the admin principal can. Authorization grants include `account_id`, even when that value is empty for a default account. The verified principal, not a client-supplied actor name, is used for organization-mode audit attribution. Missing credentials produce HTTP 401 and denied grants produce HTTP 403. `/health` is unauthenticated and returns no vault contents.
 
-For a non-loopback bind, the API refuses to start unless both an organization
-policy and TLS certificate/key are configured. Clients must validate the
-server certificate. Never expose the legacy single-token or unauthenticated
-mode remotely. Organization mode cannot be combined with
-`KEY_STORE_BEARER_TOKEN`.
+Policies are loaded at startup: grant changes and revocations require an API restart. Keep the policy and admin token protected separately. Organization mode cannot be combined with `KEY_STORE_BEARER_TOKEN`. A non-loopback HTTP bind is refused unless **both** an organization policy and TLS certificate/key are configured. Clients must validate the server certificate. Do not expose legacy single-token or unauthenticated mode to a network.
 
-This is a single-vault, single-active-server boundary, not a clustered or
-high-availability secrets service. Back up the encrypted DuckDB file and KEK
-material together, keep the KEK out of the repository, and arrange secure
-bootstrap/recovery before relying on the vault for company operations. MCP
-remains a trusted local stdio process and does not inherit per-installation
-HTTP grants. This first step does not yet centralize all ThickTicket company
-configuration or provision installation tokens automatically.
+## Interfaces and operations
 
-## Running the MCP Server
+The HTTP API supports create/read/delete operations for authorizations, passwords, certificates, and Git profiles, plus key status and rewrap operations. The MCP server offers corresponding tools, including `save_*`, `get_*`, and `delete_*` operations, profile listing, `key_status`, and `rewrap_all_records`. See [API_SPEC.md](API_SPEC.md) for exact request bodies, paths, and responses.
 
-Run directly from source:
+Certificate support covers PEM X.509 chains with unencrypted or legacy PEM-encrypted private-key blocks. PKCS#12/PFX and PKCS#8 `ENCRYPTED PRIVATE KEY` are not supported. Authorization expiry values require RFC 3339 timestamps with an explicit offset or `Z`.
 
-```bash
-go run ./cmd/squidkeys-mcp
+Operationally, treat the database, KEKs, tokens, and policy as distinct assets:
+
+1. Provision a private database location and KEK source before starting either interface.
+2. In organization mode, issue a different random token to each installation and grant only required record reads.
+3. Verify client TLS trust and authorization before placing the API on a non-loopback interface.
+4. Back up and test recovery of both encrypted data and KEK material; retain old KEKs during a rewrap migration.
+5. Restart the API after policy changes and verify revoked clients are denied.
+
+Audit events are stored in the vault database, so a database compromise or loss also affects audit evidence. SquidKeys is not a hardened external audit service, clustered secret manager, or automatic token-provisioning system.
+
+## Releases and compatibility
+
+The release helper builds both binaries and packages `README.md` and `API_SPEC.md`. Archive names intentionally retain the historical `squidkeys-go_` prefix. For example, a published v0.2.0 Linux/amd64 archive would be located at:
+
+```text
+https://github.com/LynnColeArt/squidkeys/releases/download/v0.2.0/squidkeys-go_0.2.0_linux_amd64.tar.gz
 ```
 
-Run a built binary:
+Build a package for the current platform with `./scripts/build-release.sh`, or set `SQUIDKEYS_RELEASE_TARGETS` to a space-separated `GOOS/GOARCH` matrix. `SQUIDKEYS_RELEASE_DIR` changes the output directory (default: `dist/`). Publishing a release and attaching archives is a separate operation; the URL above is an archive naming example, not a guarantee that an asset has been published.
 
-```bash
-./bin/squidkeys-mcp
-```
+The Go module path is intentionally still `github.com/LynnColeArt/squidkeys-go`. Existing consumers can continue to import it while GitHub redirects the former repository URL. A future module-path migration would require a coordinated major compatibility decision; this repository rename does not imply one. The Python compatibility harness now resolves the archived source explicitly from `SquidKeys-python` rather than relying on the old redirect.
 
-This server currently uses `stdio` transport and is intended to be launched by a local MCP host.
-
-## Illustrative Git Profile Workflow
-
-Here is a practical example of how to use SquidKeys as the storage layer for Git profile switching.
-
-### 1. Store the HTTPS credential
-
-```bash
-curl \
-  -X PUT http://127.0.0.1:8080/v1/passwords \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "agent_id": "desktop-agent",
-    "name": "github-work-pat",
-    "password": "ghp_example_token"
-  }'
-```
-
-### 2. Store the SSH private key as a password blob
-
-```bash
-curl \
-  -X PUT http://127.0.0.1:8080/v1/passwords \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "agent_id": "desktop-agent",
-    "name": "github-work-ssh",
-    "password": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
-  }'
-```
-
-### 3. Store the signing certificate bundle
-
-```bash
-curl \
-  -X PUT http://127.0.0.1:8080/v1/certificates \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "agent_id": "desktop-agent",
-    "name": "github-work-signing",
-    "certificate_chain_pem": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n",
-    "private_key_pem": "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n",
-    "private_key_passphrase": "optional-passphrase"
-  }'
-```
-
-### 4. Store the Git profile manifest
-
-```bash
-curl \
-  -X PUT http://127.0.0.1:8080/v1/git-profiles \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "agent_id": "desktop-agent",
-    "name": "work",
-    "platform": "github",
-    "host": "github.com",
-    "git_username": "workuser",
-    "git_email": "work@example.com",
-    "preferred_transport": "ssh",
-    "https_credential_ref": {
-      "record_type": "password",
-      "name": "github-work-pat"
-    },
-    "ssh_identity_ref": {
-      "record_type": "password",
-      "name": "github-work-ssh"
-    },
-    "signing_identity_ref": {
-      "record_type": "certificate",
-      "name": "github-work-signing"
-    },
-    "signing_format": "x509",
-    "repo_matchers": [
-      "github.com/work/*"
-    ]
-  }'
-```
-
-### 5. Let the switcher consume the manifest
-
-The separate switcher should:
-
-- list Git profile manifests from SquidKeys
-- fetch the selected manifest
-- resolve the referenced secret records
-- write `git config`, SSH includes, and any helper files it needs
-- track which profile is currently active outside of SquidKeys
-
-That keeps the switching logic isolated from secret storage.
-
-## Security Notes
-
-- Secret payloads are encrypted with a per-record DEK wrapped by the active KEK.
-- The DB directory is forced to mode `0700` and the DB file to `0600`.
-- Authorization expiry parsing rejects naive timestamps and requires explicit RFC3339 offsets or `Z`.
-- HTTP bearer auth is optional by design for localhost/local-first usage.
-- Organization HTTP mode requires per-installation bearer identities and exact grants.
-- Git profile manifests are plaintext metadata plus refs. They intentionally do not contain raw secrets.
-
-Certificate limitations:
-
-- PEM certificate chains are supported
-- Private keys may be unencrypted PEM or legacy PEM-encrypted PEM blocks
-- PKCS#12/PFX is not supported yet
-- PKCS#8 `ENCRYPTED PRIVATE KEY` is not supported yet
-
-## API Reference
-
-The full API contract lives in [API_SPEC.md](API_SPEC.md).
-
-High-level HTTP routes:
-
-- `PUT/GET/DELETE /v1/authorizations`
-- `PUT/GET/DELETE /v1/passwords`
-- `PUT/GET/DELETE /v1/certificates`
-- `PUT/GET/LIST/DELETE /v1/git-profiles`
-- `GET /v1/keys/status`
-- `POST /v1/keys/rewrap`
-
-High-level MCP tools:
-
-- `save_authorization`, `get_authorization`, `delete_authorization`
-- `save_password`, `get_password`, `delete_password`
-- `save_certificate`, `get_certificate`, `delete_certificate`
-- `save_git_profile`, `get_git_profile`, `list_git_profiles`, `delete_git_profile`
-- `key_status`, `rewrap_all_records`
-
-## Development and Verification
-
-Run the test suite:
+## Verification
 
 ```bash
 go test ./...
-```
-
-Run the race detector:
-
-```bash
 go test -race ./...
-```
-
-Run `go vet`:
-
-```bash
 go vet ./...
-```
-
-Run the Python compatibility harness for the original authorization/password format:
-
-```bash
 ./scripts/run-python-compat.sh
 ```
 
-GitHub Actions runs the same core verification on pushes to `main`, pull requests, and manual dispatches:
-
-- `go test ./...`
-- `go test -race ./...`
-- `go vet ./...`
-- a release-packaging smoke test via `./scripts/build-release.sh`
-
-The workflow lives at `.github/workflows/ci.yml`.
-
-## Project Layout
-
-- `cmd/squidkeys-api`: HTTP server entrypoint
-- `cmd/squidkeys-mcp`: MCP server entrypoint
-- `scripts/build-release.sh`: local release packaging helper
-- `store.go`: encrypted store setup, schema, and KEK rewrap logic
-- `api.go`: HTTP handlers
-- `mcp.go`: MCP tool handlers
-- `certificates.go`: certificate storage and X.509 parsing
-- `gitprofiles.go`: Git profile manifest storage and ref validation
-- `API_SPEC.md`: API contract
+The Python harness checks cross-implementation reads, writes, and rewraps for the original authorization/password format. It downloads the archived Python repository if `SQUIDKEYS_PYTHON_SOURCE` is not set; it also creates a local virtual environment and installs Python test dependencies. CI runs the Go test suite, race detector, vet, and a release-packaging smoke test. See [`.github/workflows/ci.yml`](.github/workflows/ci.yml).

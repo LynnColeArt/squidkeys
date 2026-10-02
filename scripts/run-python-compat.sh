@@ -11,7 +11,7 @@ mkdir -p "${TMP_DIR}"
 PYTHON_SOURCE="${SQUIDKEYS_PYTHON_SOURCE:-${REFERENCE_REPO}/src}"
 if [[ ! -f "${PYTHON_SOURCE}/key_store/store.py" ]]; then
   if [[ ! -d "${REFERENCE_REPO}/.git" ]]; then
-    git clone --depth 1 https://github.com/LynnColeArt/SquidKeys.git "${REFERENCE_REPO}"
+    git clone --depth 1 https://github.com/LynnColeArt/SquidKeys-python.git "${REFERENCE_REPO}"
   fi
   PYTHON_SOURCE="${REFERENCE_REPO}/src"
 fi
