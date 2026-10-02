@@ -152,7 +152,6 @@ func buildBinary(t *testing.T, name, pkg string) string {
 
 	binaryPath := filepath.Join(t.TempDir(), name)
 	cmd := exec.Command("go", "build", "-o", binaryPath, pkg)
-	cmd.Dir = "/home/lynn/projects/squidkeys-go"
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build %s: %v\n%s", name, err, output)
