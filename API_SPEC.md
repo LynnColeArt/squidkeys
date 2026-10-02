@@ -24,6 +24,18 @@ HTTP bearer auth is optional.
 - If `KEY_STORE_BEARER_TOKEN` is unset, requests are accepted without an `Authorization` header.
 - If `KEY_STORE_BEARER_TOKEN` is set, send `Authorization: Bearer <token>`.
 
+The opt-in organization HTTP mode is enabled by
+`KEY_STORE_ORG_AUTH_POLICY_PATH`; it cannot be combined with the legacy token.
+The version-1 policy names admin principals and reader principals with exact
+`record_type`/`agent_id`/`name` grants (or `provider` and `account_id` for
+authorizations). Tokens are verified against SHA-256 digests from the policy;
+readers cannot write, delete, list git profiles, or access key endpoints.
+Authorization GET requests from readers must explicitly include `account_id`.
+In this mode all audit actors are derived from the verified principal, never
+from the request body or `actor` query. Policy changes require restart.
+Non-loopback API binding additionally requires a TLS certificate/key.
+`GET /health` remains public. See README for deployment limitations.
+
 MCP authentication depends on the host process that launches the server.
 
 ## Common Behavior
